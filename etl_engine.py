@@ -19,28 +19,55 @@ load_dotenv()
 class DatabaseConnector:
     """
     Classe responsável por gerenciar a criação de engines de banco de dados de forma segura e padronizada.
+    Design Pattern: Factory Method simples para conexões.
     """
     @staticmethod
     def get_engine(driver: str, user_env: str, pass_env: str, host_env: str, port_env: str, db_env: str):
         """
         Cria uma engine SQLAlchemy montando a URL.
+        
+        Args:
+            driver (str): Driver do banco (ex: 'mysql+pymysql', 'postgresql')
+            user_env (str): NOME da variável de ambiente do usuário
+            pass_env (str): NOME da variável de ambiente da senha
+            host_env (str): NOME da variável de ambiente do host
+            port_env (str): NOME da variável de ambiente da porta
+            db_env (str): NOME da variável de ambiente do nome do banco
         """
         try:
-            # Verifica se as variáveis de ambiente existem
-            if not os.getenv(user_env) or not os.getenv(host_env):
-                raise ValueError(f"Variáveis de ambiente para {host_env} não definidas.")
+            # Recupera valores
+            user = os.getenv(user_env)
+            password = os.getenv(pass_env)
+            host = os.getenv(host_env)
+            db_name = os.getenv(db_env)
+            
+            # Tratamento seguro para porta: se não achar, usa 3306/5432 padrão ou falha graciosamente
+            port_str = os.getenv(port_env)
+            
+            # Validação básica
+            if not user or not host or not password:
+                # Loga qual variável está faltando para facilitar debug (sem mostrar a senha)
+                missing = []
+                if not user: missing.append(user_env)
+                if not host: missing.append(host_env)
+                if not password: missing.append(pass_env)
+                raise ValueError(f"Variáveis de ambiente obrigatórias não definidas: {', '.join(missing)}")
 
-                url_object = URL.create(
-                    drivername=driver,
-                    username=os.getenv(user_env),
-                    password=os.getenv(pass_env),
-                    host=os.getenv(host_env),
-                    port=int(os.getenv(port_env)),
-                    database=os.getenv(db_env)
-                )
-                return create_engine(url_object)
+            # Define porta padrão caso a env não exista (fallback)
+            port = int(port_str) if port_str and port_str.isdigit() else 3306
+
+            url_object = URL.create(
+                drivername=driver,
+                username=user,
+                password=password,
+                host=host,
+                port=port,
+                database=db_name
+            )
+            return create_engine(url_object)
+            
         except Exception as e:
-            logger.error(f"Erro ao criar engine para {db_env}: {e}")
+            logger.error(f"Erro crítico ao criar engine para variável {db_env}: {str(e)}")
             raise e
 
 def extract_wordpress_orders(engine) -> pd.DataFrame:
@@ -48,6 +75,8 @@ def extract_wordpress_orders(engine) -> pd.DataFrame:
     Extrai pedidos utilizando a estrutura HPOS (High-Performance Order Storage)
     e cruza com dados de Pagar.me e Clientes.
     """
+    # NOTE: O LIMIT 5000 é útil para dev/homologação. 
+    # TODO: Para produção, remover o LIMIT ou implementar carga incremental (filtro por data).
     query = """
     SELECT 
         o.id AS pedido_id,
@@ -96,30 +125,40 @@ def transform_orders(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty:
         return df
     
-    # 1. Normalização de Status (remove os prefixos wc-)
-    df['status_woo'] = df['status_woo'].str.replace('wc-', '', regex=False)
+    # Cria uma cópia para evitar SettingWithCopyWarning do Pandas em alguns contextos
+    df = df.copy()
 
-    # 2. Conversão de Tiops Numéricos
-    # 'errors=coerce' transforma erros em NaN, depois preenche com 0.0
+    # 1. Normalização de Status (remove os prefixos wc-)
+    # Verifica se a coluna existe antes de tentar processar
+    if 'status_woo' in df.columns:
+        df['status_woo'] = df['status_woo'].str.replace('wc-', '', regex=False)
+
+    # 2. Conversão de Tipos Numéricos
+    # 'errors=coerce' transforma erros em NaN, depois preenchemos.
     df['valor_total'] = pd.to_numeric(df['valor_total'], errors='coerce').fillna(0.0)
     df['parcelas'] = pd.to_numeric(df['parcelas'], errors='coerce').fillna(1).astype(int)
 
     # 3. Conversão de Datas
     df['data_pedido'] = pd.to_datetime(df['data_pedido'])
 
-    # 4. Tratamento de Valores Nulos
-    df['valor_total'] = pd.to_numeric(df['valor_total'], errors='coerce').fillna(0.0)
-    df['parcelas'] = pd.to_numeric(df['parcelas'], errors='coerce').fillna(1).astype(int)
+    # 4. Tratamento Estético de Nulos (Strings)
+    # Importante para dashboards não exibirem "None" ou ficarem em branco
+    cols_texto = ['metodo_pagamento', 'nome_cliente', 'cidade', 'estado']
+    for col in cols_texto:
+        if col in df.columns:
+            df[col] = df[col].fillna('Não Informado')
 
     return df
 
 def run_etl() -> Tuple[bool, List[str]]:
     """
     Função principal para executar o processo ETL.
+    Retorna uma tupla (Sucesso, Lista de Logs para UI).
     """
     ui_logs = []
 
     def log_msg(message: str, level='info'):
+        """Helper interno para logar no console e guardar para a UI"""
         if level == 'info':
             logger.info(message)
             ui_logs.append(f"INFO: {message}")
@@ -133,33 +172,50 @@ def run_etl() -> Tuple[bool, List[str]]:
     try:
         log_msg("Iniciando processo ETL de pedidos do WordPress.")
 
-        # 1. conexões com bancos de dados
+        # 1. Conexões com bancos de dados
+        # A classe DatabaseConnector espera o NOME da variável de ambiente no .env
+        
+        # Conexão Origem (WordPress)
         engine_wp = DatabaseConnector.get_engine(
             "mysql+pymysql", "WP_USER", "WP_PASS", "WP_HOST", "WP_PORT", "WP_DB_NAME"
         )
         
+        # Conexão Destino (Data Warehouse)
+        # Hack: Definimos variáveis de ambiente "virtuais" caso elas não estejam no .env 
+        # para manter o padrão da classe DatabaseConnector, ou garantimos que elas existam no .env.
+        if not os.getenv("POSTGRES_HOST"): os.environ["POSTGRES_HOST"] = "dw"
+        if not os.getenv("POSTGRES_PORT"): os.environ["POSTGRES_PORT"] = "5432"
+
         engine_dw = DatabaseConnector.get_engine(
-            "postgresql", "POSTGRES_USER", "POSTGRES_PASSWORD", "dw", "5432", "POSTGRES_DB"
+            "postgresql", 
+            "POSTGRES_USER", 
+            "POSTGRES_PASSWORD", 
+            "POSTGRES_HOST",  # Passando o nome da chave, não o valor "dw"
+            "POSTGRES_PORT",  # Passando o nome da chave, não o valor "5432"
+            "POSTGRES_DB"
         )
 
         # 2. Pipeline Principal
-        log_msg("Extraindo dados consolidados (Pedidos + Clientes + Financeiro)...")
+        log_msg("📥 Extraindo dados consolidados (Pedidos + Clientes + Financeiro)...")
         df_raw = extract_wordpress_orders(engine_wp)
 
         if not df_raw.empty:
-            log_msg(f"{len(df_raw)} linhas extraídas com sucesso. Tratamento dos dados em andamento...")
+            log_msg(f"🛠️ {len(df_raw)} linhas extraídas. Iniciando tratamento...")
 
             df_clean = transform_orders(df_raw)
-            log_msg("Dados tratados com sucesso. Iniciando carga no Data Warehouse...")
+            
+            log_msg("💾 Salvando dados no Data Warehouse...")
+            
+            # Utiliza chunksize para evitar estouro de memória em grandes volumes
             df_clean.to_sql('pedidos_consolidados', engine_dw, if_exists='replace', index=False, chunksize=1000)
 
-            log_msg(f"Carga concluída com sucesso. Foram adicionados {len(df_clean)} registros no DW.", level='success')
+            log_msg(f"Carga concluída! {len(df_clean)} registros atualizados.", level='success')
 
         else:
-            log_msg("Nenhum pedido encontrado na tabela wp_wc_orders.", level = "info")
+            log_msg("Nenhum pedido encontrado na tabela wp_wc_orders.", level="info")
 
         return True, ui_logs
 
     except Exception as e:
-        log_msg(f"Erro Crítico no ETL: {str(e)}", "error")
+        log_msg(f"Falha Crítica no ETL: {str(e)}", "error")
         return False, ui_logs
