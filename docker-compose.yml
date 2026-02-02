@@ -1,0 +1,86 @@
+version: '3.8'  # Versão estável com suporte a recursos modernos de orquestração.
+
+services:
+  # ---------------------------------------------------------------------------
+  # SERVIÇO 1: DATA WAREHOUSE (PostgreSQL)
+  # Responsável pela persistência analítica dos dados consolidados.
+  # ---------------------------------------------------------------------------
+  dw:
+    image: postgres:15  # Versão fixa (pinada) para evitar breaking changes automáticos (evite 'latest' em produção).
+    container_name: analytics_dw
+    
+    # SEGURANÇA & CONFIGURAÇÃO:
+    # Carrega variáveis de ambiente do arquivo .env para o contexto do container.
+    env_file: .env
+    
+    # INTERPOLAÇÃO DE VARIÁVEIS (Shell Parameter Expansion):
+    # A sintaxe ${VAR:-default} define um valor padrão caso a variável não exista no .env.
+    # Isso garante resiliência e documenta os valores default esperados.
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-admin}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_DB: warehouse
+    
+    # PERSISTÊNCIA (Bind Mount):
+    # Mapeia um diretório do Host (servidor) diretamente para o Container.
+    # Vantagem: Facilita backups manuais (cp/rsync) e acesso direto aos arquivos brutos (.ibd/.dat) pelo sysadmin.
+    volumes:
+      - ./postgres_dados:/var/lib/postgresql/data
+    
+    # REDE:
+    # Conecta-se à rede onde estão os bancos de produção (WordPress/Leitor) para permitir a extração.
+    networks:
+      - internal_net
+
+  # ---------------------------------------------------------------------------
+  # SERVIÇO 2: DASHBOARD & ETL (Streamlit + Python)
+  # Interface visual e motor de processamento de dados.
+  # ---------------------------------------------------------------------------
+  dashboard:
+    build: .  # Constrói a imagem localmente baseada no Dockerfile presente no diretório.
+    container_name: analytics_dashboard
+    
+    # EXPOSIÇÃO DE PORTAS:
+    # Mapeia a porta 8501 do container para a 8501 do host.
+    # Necessário para que o usuário final acesse a interface via navegador.
+    ports:
+      - "8501:8501"
+    
+    # ORQUESTRAÇÃO DE INICIALIZAÇÃO:
+    # Garante que o container do Dashboard inicie apenas após o container do DW ser criado.
+    # Nota Técnica: Isso não garante que o Postgres esteja "pronto" para conexões (TCP Ready), 
+    # apenas que o container iniciou. O script Python deve tratar retentativas de conexão.
+    depends_on:
+      - dw
+    
+    # INJEÇÃO DE AMBIENTE:
+    # Carrega as chaves para uso via os.getenv() no Python.
+    env_file: .env
+    
+    # VOLUMES E ARQUIVOS DE CONFIGURAÇÃO:
+    # Monta o arquivo físico .env dentro do container.
+    # Necessário caso a aplicação utilize bibliotecas como 'python-dotenv' que buscam o arquivo em disco,
+    # além de permitir hot-reload de configurações sem recriar o container (dependendo da lógica da app).
+    volumes:
+      - ./.env:/app/.env
+    
+    # CONSTRUÇÃO DINÂMICA DE STRING DE CONEXÃO (DRY - Don't Repeat Yourself):
+    # Constrói a URI do banco reutilizando as variáveis já definidas, evitando duplicidade
+    # e risco de dessincronia entre senha do banco e senha da aplicação.
+    environment:
+      - DW_URI=postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-password}@dw:5432/warehouse
+    
+    networks:
+      - internal_net
+
+# ---------------------------------------------------------------------------
+# DEFINIÇÃO DE REDES
+# ---------------------------------------------------------------------------
+networks:
+  internal_net:
+    # EXTERNAL: TRUE
+    # Crítico para a arquitetura proposta. Informa ao Docker Compose que esta rede
+    # JÁ EXISTE (criada pelo stack do WordPress) e não deve ser criada novamente.
+    # Permite a resolução de DNS entre containers de stacks diferentes (ex: ping db).
+    external: true
+    name: internal_net
