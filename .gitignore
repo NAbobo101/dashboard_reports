@@ -1,2 +1,14 @@
+# arquivos de ambiente
 .env
+.env.local
+*.env
+
+# Dados do Banco de Dados (Nunca enviar dados reais)
+postgres_dados/
+mysql_data/
+
+# Python Cache e Ambientes Virtuais
+__pycache__/
 *.pyc
+venv/
+.pytest_cache/

@@ -84,6 +84,3 @@ networks:
     # Permite a resolução de DNS entre containers de stacks diferentes (ex: ping db).
     external: true
     name: internal_net
-
-
-# teste de commit 

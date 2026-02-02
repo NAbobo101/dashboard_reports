@@ -1,0 +1,7 @@
+# Ignorar Git e Segredos na construção da imagem
+.git
+.gitignore
+.env
+postgres_dados/
+README.md
+docker-compose.yml
