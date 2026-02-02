@@ -17,8 +17,8 @@ services:
     # A sintaxe ${VAR:-default} define um valor padrão caso a variável não exista no .env.
     # Isso garante resiliência e documenta os valores default esperados.
     environment:
-      POSTGRES_USER: ${POSTGRES_USER:-admin}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: warehouse
     
     # PERSISTÊNCIA (Bind Mount):
@@ -68,7 +68,7 @@ services:
     # Constrói a URI do banco reutilizando as variáveis já definidas, evitando duplicidade
     # e risco de dessincronia entre senha do banco e senha da aplicação.
     environment:
-      - DW_URI=postgresql://${POSTGRES_USER:-admin}:${POSTGRES_PASSWORD:-password}@dw:5432/warehouse
+      - DW_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@dw:5432/warehouse
     
     networks:
       - internal_net
