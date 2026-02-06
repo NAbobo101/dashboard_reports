@@ -6,7 +6,10 @@
 # Dados do Banco de Dados (Nunca enviar dados reais)
 postgres_dados/
 mysql_data/
-
+mysql_dados/
+backup_completo_wordpress.sql
+*.sql
+*.sh
 # Python Cache e Ambientes Virtuais
 __pycache__/
 *.pyc

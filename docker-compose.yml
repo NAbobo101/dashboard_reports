@@ -1,86 +1,149 @@
-version: '3.8'  # Versão estável com suporte a recursos modernos de orquestração.
+version: "3.9"
+
+# ------------------------------------------------------------------------------
+# docker-compose.yml
+# Serviços:
+# - db: MySQL 8 com volume persistente + init scripts
+# - app: Streamlit (construído via Dockerfile)
+# - adminer: UI simples para acessar o banco (opcional, útil em dev)
+#
+# Correções principais:
+# 1) App passa a conectar usando o usuário read-only (STREAMLIT_RO_USER/PASSWORD)
+# 2) DB_NAME passa a ser "core" (garante que o usuário tenha permissão no DB da URL)
+# 3) Healthcheck do MySQL usa CMD-SHELL e a variável do próprio container (mais confiável)
+# 4) Opcional: MYSQL_ROOT_HOST='%' para permitir root remoto em DEV (Adminer/debug)
+# ------------------------------------------------------------------------------
 
 services:
-  # ---------------------------------------------------------------------------
-  # SERVIÇO 1: DATA WAREHOUSE (PostgreSQL)
-  # Responsável pela persistência analítica dos dados consolidados.
-  # ---------------------------------------------------------------------------
-  dw:
-    image: postgres:15  # Versão fixa (pinada) para evitar breaking changes automáticos (evite 'latest' em produção).
-    container_name: analytics_dw
-    
-    # SEGURANÇA & CONFIGURAÇÃO:
-    # Carrega variáveis de ambiente do arquivo .env para o contexto do container.
-    env_file: .env
-    
-    # INTERPOLAÇÃO DE VARIÁVEIS (Shell Parameter Expansion):
-    # A sintaxe ${VAR:-default} define um valor padrão caso a variável não exista no .env.
-    # Isso garante resiliência e documenta os valores default esperados.
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: warehouse
-    
-    # PERSISTÊNCIA (Bind Mount):
-    # Mapeia um diretório do Host (servidor) diretamente para o Container.
-    # Vantagem: Facilita backups manuais (cp/rsync) e acesso direto aos arquivos brutos (.ibd/.dat) pelo sysadmin.
-    volumes:
-      - ./postgres_dados:/var/lib/postgresql/data
-    
-    # REDE:
-    # Conecta-se à rede onde estão os bancos de produção (WordPress/Leitor) para permitir a extração.
-    networks:
-      - internal_net
+  db:
+    image: mysql:8.0
+    container_name: project-mysql
+    restart: unless-stopped
 
-  # ---------------------------------------------------------------------------
-  # SERVIÇO 2: DASHBOARD & ETL (Streamlit + Python)
-  # Interface visual e motor de processamento de dados.
-  # ---------------------------------------------------------------------------
-  dashboard:
-    build: .  # Constrói a imagem localmente baseada no Dockerfile presente no diretório.
-    container_name: analytics_dashboard
-    
-    # EXPOSIÇÃO DE PORTAS:
-    # Mapeia a porta 8501 do container para a 8501 do host.
-    # Necessário para que o usuário final acesse a interface via navegador.
+    # Carrega variáveis do arquivo .env (não commitar)
+    env_file:
+      - .env
+
+    environment:
+      # Evita carregar timezones no init (reduz tempo de bootstrap)
+      MYSQL_INITDB_SKIP_TZINFO: "1"
+
+      # Permite login de root pela rede docker (DEV).
+      # Em produção, recomenda-se restringir.
+      MYSQL_ROOT_HOST: "%"
+
+      # Opcional: define timezone dentro do container
+      TZ: "America/Sao_Paulo"
+
+    # Ajustes de servidor:
+    # - mysql_native_password: compatibilidade com alguns clientes
+    # - character-set / collation: padronização
+    command: >
+      --default-authentication-plugin=mysql_native_password
+      --character-set-server=utf8mb4
+      --collation-server=utf8mb4_0900_ai_ci
+
+    ports:
+      # Expor no host para ferramentas locais (DBeaver etc.)
+      - "3306:3306"
+
+    volumes:
+      # Dados persistentes
+      - mysql_data:/var/lib/mysql
+
+      # Scripts .sql/.sh aqui rodam na primeira inicialização do volume
+      # Atenção: se o volume já existe, scripts não rodam novamente.
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+
+    networks:
+      - backend
+
+    # Healthcheck robusto:
+    # - CMD-SHELL executa via shell dentro do container
+    # - $$ escapa para o Compose não tentar substituir; quem substitui é o shell no container
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -p$${MYSQL_ROOT_PASSWORD} --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+
+
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: project-streamlit
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      # Conexão com MySQL via rede docker
+      DB_HOST: db
+      DB_PORT: "3306"
+
+      # IMPORTANTE:
+      # DB_NAME precisa ser um database que o usuário tenha permissão,
+      # pois ele entra na URL de conexão. Como seu read-only tem SELECT em core.*,
+      # apontar pra "core" evita "Access denied to database".
+      DB_NAME: "core"
+
+      # Correção principal:
+      # O Streamlit deve usar o usuário read-only criado no init (least privilege).
+      # Essas vars devem existir no .env:
+      # STREAMLIT_RO_USER=streamlit_ro
+      # STREAMLIT_RO_PASSWORD=...
+      STREAMLIT_RO_USER: "${STREAMLIT_RO_USER}"
+      STREAMLIT_RO_PASSWORD: "${STREAMLIT_RO_PASSWORD}"
+
+      # Mantemos DB_USER/DB_PASSWORD também, para compatibilidade com o seu main.py
+      # (ele pode ler DB_USER/DB_PASSWORD ou STREAMLIT_RO_* dependendo da versão).
+      DB_USER: "${STREAMLIT_RO_USER}"
+      DB_PASSWORD: "${STREAMLIT_RO_PASSWORD}"
+
+      # Streamlit em container (sem tentar abrir browser)
+      STREAMLIT_SERVER_HEADLESS: "true"
+
+      # Opcional: timezone do container
+      TZ: "America/Sao_Paulo"
+
     ports:
       - "8501:8501"
-    
-    # ORQUESTRAÇÃO DE INICIALIZAÇÃO:
-    # Garante que o container do Dashboard inicie apenas após o container do DW ser criado.
-    # Nota Técnica: Isso não garante que o Postgres esteja "pronto" para conexões (TCP Ready), 
-    # apenas que o container iniciou. O script Python deve tratar retentativas de conexão.
-    depends_on:
-      - dw
-    
-    # INJEÇÃO DE AMBIENTE:
-    # Carrega as chaves para uso via os.getenv() no Python.
-    env_file: .env
-    
-    # VOLUMES E ARQUIVOS DE CONFIGURAÇÃO:
-    # Monta o arquivo físico .env dentro do container.
-    # Necessário caso a aplicação utilize bibliotecas como 'python-dotenv' que buscam o arquivo em disco,
-    # além de permitir hot-reload de configurações sem recriar o container (dependendo da lógica da app).
-    volumes:
-      - ./.env:/app/.env
-    
-    # CONSTRUÇÃO DINÂMICA DE STRING DE CONEXÃO (DRY - Don't Repeat Yourself):
-    # Constrói a URI do banco reutilizando as variáveis já definidas, evitando duplicidade
-    # e risco de dessincronia entre senha do banco e senha da aplicação.
-    environment:
-      - DW_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@dw:5432/warehouse
-    
-    networks:
-      - internal_net
 
-# ---------------------------------------------------------------------------
-# DEFINIÇÃO DE REDES
-# ---------------------------------------------------------------------------
+    depends_on:
+      db:
+        condition: service_healthy
+
+    networks:
+      - backend
+
+    # DEV: hot reload
+    volumes:
+      - ./app:/app/app:rw
+
+
+  adminer:
+    image: adminer:4
+    container_name: project-adminer
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+    networks:
+      - backend
+
+
+
 networks:
-  internal_net:
-    # EXTERNAL: TRUE
-    # Crítico para a arquitetura proposta. Informa ao Docker Compose que esta rede
-    # JÁ EXISTE (criada pelo stack do WordPress) e não deve ser criada novamente.
-    # Permite a resolução de DNS entre containers de stacks diferentes (ex: ping db).
-    external: true
-    name: internal_net
+  backend:
+    name: project-backend
+    driver: bridge
+
+
+volumes:
+  mysql_data:
+    name: project-mysql-data

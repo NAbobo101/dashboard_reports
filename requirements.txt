@@ -1,7 +1,5 @@
-streamlit
-pandas
-sqlalchemy
-psycopg2-binary
-pymysql
-plotly
-python-dotenv
+streamlit==1.37.1
+SQLAlchemy==2.0.32
+pymysql==1.1.1
+pandas==2.2.2
+python-dotenv==1.0.1
