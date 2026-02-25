@@ -6,7 +6,7 @@ Streamlit Data Browser para MySQL.
 - Conexão: preferir credenciais read-only (STREAMLIT_RO_USER/STREAMLIT_RO_PASSWORD).
 
 Env:
-  DB_HOST, DB_PORT, DB_NAME (opcional; default=information_schema)
+  DB_HOST, DB_PORT, DB_NAME (opcional; default=mercado_livre)
   STREAMLIT_RO_USER, STREAMLIT_RO_PASSWORD (preferencial)
   DB_USER, DB_PASSWORD (fallback)
 """
@@ -50,7 +50,7 @@ class DBConfig:
     port: int
     user: str
     password: str
-    default_database: str = "information_schema"
+    default_database: str = "mercado_livre"  # fallback seguro; pode ser override por DB_NAME
 
 
 def _required_env(name: str) -> str:
@@ -94,12 +94,12 @@ def load_db_config() -> DBConfig:
         )
 
     # DB_NAME é opcional. Se existir e for válido, usamos; senão, fallback seguro.
-    default_db = os.getenv("DB_NAME", "information_schema")
+    default_db = os.getenv("DB_NAME", "mercado_livre")
 
     # _is_safe_identifier é definido abaixo; ok em Python porque a função só é
     # avaliada quando load_db_config() roda (depois do módulo carregado).
     if not _is_safe_identifier(default_db):
-        default_db = "information_schema"
+        default_db = "mercado_livre"  # fallback seguro
 
     return DBConfig(
         host=host,
@@ -144,7 +144,7 @@ def get_engine(cfg: DBConfig) -> Engine:
 # Importante:
 # - Reduz superfície: o usuário só navega em databases conhecidos e esperados.
 # - Evita ataques/bugs via namespacing (schema vindo do input).
-ALLOWED_SCHEMAS = ("staging", "core", "wordpress", "active_campaign")
+ALLOWED_SCHEMAS = ("staging", "core", "wordpress", "active_campaign", "mercado_livre")
 
 # Regex conservadora: só permite letras/números/underscore.
 # Isso bloqueia espaços, hífen, ponto, aspas, etc.
@@ -180,7 +180,7 @@ def is_safe_identifier(value: str) -> bool:
 
 def list_tables_and_views(engine: Engine, schema: str) -> List[Tuple[str, str]]:
     """
-    Lista tabelas e views do schema usando information_schema.
+    Lista tabelas e views do schema usando mercado_livre.
 
     Retorno:
       Lista de (TABLE_NAME, TABLE_TYPE), onde TABLE_TYPE é:
@@ -193,7 +193,7 @@ def list_tables_and_views(engine: Engine, schema: str) -> List[Tuple[str, str]]:
     """
     q = text("""
         SELECT TABLE_NAME, TABLE_TYPE
-        FROM information_schema.TABLES
+        FROM mercado_livre.TABLES
         WHERE TABLE_SCHEMA = :schema
         ORDER BY TABLE_TYPE, TABLE_NAME
     """)

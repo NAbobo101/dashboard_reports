@@ -1,66 +1,57 @@
-version: "3.9"
-
 # ------------------------------------------------------------------------------
 # docker-compose.yml
 # Serviços:
-# - db: MySQL 8 com volume persistente + init scripts
+# - db_relatorios: MySQL 8 com volume persistente + init scripts
 # - app: Streamlit (construído via Dockerfile)
 # - adminer: UI simples para acessar o banco (opcional, útil em dev)
+# - etl: Runner ETL (Mercado Livre)
+# - meli_oauth: Serviço interno de OAuth (FastAPI) que faz init/consume/token + refresh
 #
-# Correções principais:
-# 1) App passa a conectar usando o usuário read-only (STREAMLIT_RO_USER/PASSWORD)
-# 2) DB_NAME passa a ser "core" (garante que o usuário tenha permissão no DB da URL)
-# 3) Healthcheck do MySQL usa CMD-SHELL e a variável do próprio container (mais confiável)
-# 4) Opcional: MYSQL_ROOT_HOST='%' para permitir root remoto em DEV (Adminer/debug)
+# Ajustes importantes:
+# 1) Evita conflito de porta no host (MySQL publica em 3307:3306)
+# 2) Evita colisão de DNS na rede shared internal_net (service name não é "db")
+# 3) OAuth automático: WordPress só recebe code/state e repassa para meli_oauth via internal_net
+#
+# CORREÇÃO ADMINER:
+# - O Adminer (e/ou o operador) estava tentando usar "db" como host.
+# - O serviço real do MySQL chama "db_relatorios".
+# - Adicionamos alias "db" na network backend para compatibilidade.
+# - Definimos ADMINER_DEFAULT_SERVER para sugerir o host correto na UI.
 # ------------------------------------------------------------------------------
 
 services:
-  db:
+  db_relatorios:
     image: mysql:8.0
     container_name: project-mysql
     restart: unless-stopped
 
-    # Carrega variáveis do arquivo .env (não commitar)
     env_file:
       - .env
 
     environment:
-      # Evita carregar timezones no init (reduz tempo de bootstrap)
       MYSQL_INITDB_SKIP_TZINFO: "1"
-
-      # Permite login de root pela rede docker (DEV).
-      # Em produção, recomenda-se restringir.
       MYSQL_ROOT_HOST: "%"
-
-      # Opcional: define timezone dentro do container
       TZ: "America/Sao_Paulo"
 
-    # Ajustes de servidor:
-    # - mysql_native_password: compatibilidade com alguns clientes
-    # - character-set / collation: padronização
     command: >
       --default-authentication-plugin=mysql_native_password
       --character-set-server=utf8mb4
       --collation-server=utf8mb4_0900_ai_ci
 
     ports:
-      # Expor no host para ferramentas locais (DBeaver etc.)
-      - "3306:3306"
+      - "3307:3306"
 
     volumes:
-      # Dados persistentes
       - mysql_data:/var/lib/mysql
-
-      # Scripts .sql/.sh aqui rodam na primeira inicialização do volume
-      # Atenção: se o volume já existe, scripts não rodam novamente.
       - ./db/init:/docker-entrypoint-initdb.d:ro
 
+    # Mantemos internal_net e backend, mas agora com alias "db" no backend
     networks:
-      - backend
+      backend:
+        aliases:
+          - db
+      internal_net: {}
 
-    # Healthcheck robusto:
-    # - CMD-SHELL executa via shell dentro do container
-    # - $$ escapa para o Compose não tentar substituir; quem substitui é o shell no container
     healthcheck:
       test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -p$${MYSQL_ROOT_PASSWORD} --silent"]
       interval: 10s
@@ -80,46 +71,30 @@ services:
       - .env
 
     environment:
-      # Conexão com MySQL via rede docker
-      DB_HOST: db
+      # Pode usar db_relatorios (recomendado) ou "db" (alias de compatibilidade)
+      DB_HOST: db_relatorios
       DB_PORT: "3306"
-
-      # IMPORTANTE:
-      # DB_NAME precisa ser um database que o usuário tenha permissão,
-      # pois ele entra na URL de conexão. Como seu read-only tem SELECT em core.*,
-      # apontar pra "core" evita "Access denied to database".
       DB_NAME: "core"
 
-      # Correção principal:
-      # O Streamlit deve usar o usuário read-only criado no init (least privilege).
-      # Essas vars devem existir no .env:
-      # STREAMLIT_RO_USER=streamlit_ro
-      # STREAMLIT_RO_PASSWORD=...
       STREAMLIT_RO_USER: "${STREAMLIT_RO_USER}"
       STREAMLIT_RO_PASSWORD: "${STREAMLIT_RO_PASSWORD}"
 
-      # Mantemos DB_USER/DB_PASSWORD também, para compatibilidade com o seu main.py
-      # (ele pode ler DB_USER/DB_PASSWORD ou STREAMLIT_RO_* dependendo da versão).
       DB_USER: "${STREAMLIT_RO_USER}"
       DB_PASSWORD: "${STREAMLIT_RO_PASSWORD}"
 
-      # Streamlit em container (sem tentar abrir browser)
       STREAMLIT_SERVER_HEADLESS: "true"
-
-      # Opcional: timezone do container
       TZ: "America/Sao_Paulo"
 
     ports:
       - "8501:8501"
 
     depends_on:
-      db:
+      db_relatorios:
         condition: service_healthy
 
     networks:
       - backend
 
-    # DEV: hot reload
     volumes:
       - ./app:/app/app:rw
 
@@ -128,20 +103,132 @@ services:
     image: adminer:4
     container_name: project-adminer
     restart: unless-stopped
+
     depends_on:
-      db:
+      db_relatorios:
         condition: service_healthy
+
     ports:
       - "8080:8080"
+
+    environment:
+      # Faz o campo "Server" já vir preenchido corretamente.
+      ADMINER_DEFAULT_SERVER: db_relatorios
+
     networks:
       - backend
 
+
+  # ----------------------------------------------------------------------------
+  # Serviço interno OAuth (FastAPI)
+  # ----------------------------------------------------------------------------
+  meli_oauth:
+    image: python:3.11-slim
+    container_name: relatorios-meli-oauth
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      # DB (schema mercado_livre)
+      MYSQL_HOST: db_relatorios
+      MYSQL_PORT: "3306"
+      MYSQL_DATABASE: "mercado_livre"
+      MYSQL_USER: "${ETL_USER}"
+      MYSQL_PASSWORD: "${ETL_PASSWORD}"
+
+      # Mercado Livre OAuth (segredos ficam aqui, não no WordPress)
+      MELI_CLIENT_ID: "${MELI_CLIENT_ID}"
+      MELI_CLIENT_SECRET: "${MELI_CLIENT_SECRET}"
+      MELI_REDIRECT_URI: "${MELI_REDIRECT_URI}"
+      MELI_SCOPE: "${MELI_SCOPE:-offline_access read write}"
+
+      # Proteção dos endpoints internos
+      MELI_INTERNAL_KEY: "${MELI_INTERNAL_KEY}"
+
+      TZ: "America/Sao_Paulo"
+      PYTHONPATH: "/app"  # Garante que "etl" seja encontrado como package
+
+    depends_on:
+      db_relatorios:
+        condition: service_healthy
+
+    networks:
+      - backend
+      - internal_net
+
+    volumes:
+      - ./etl:/app/etl:rw
+      - ./etl/requirements.txt:/app/requirements.txt:ro
+
+    working_dir: /app
+
+    command: >
+      bash -lc "
+        pip install --no-cache-dir -r /app/requirements.txt &&
+        uvicorn etl.mercado_livre.oauth.service:app --host 0.0.0.0 --port 8000
+      "
+
+
+  # ----------------------------------------------------------------------------
+  # Runner ETL Mercado Livre
+  # ----------------------------------------------------------------------------
+  etl:
+    image: python:3.11-slim
+    container_name: project-etl
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      # MySQL (schema mercado_livre)
+      MYSQL_HOST: db_relatorios
+      MYSQL_PORT: "3306"
+      MYSQL_DATABASE: "mercado_livre"
+      MYSQL_USER: "${ETL_USER}"
+      MYSQL_PASSWORD: "${ETL_PASSWORD}"
+
+      # Serviço interno OAuth (tokens/refresh)
+      MELI_OAUTH_SERVICE_URL: "http://relatorios-meli-oauth:8000"
+      MELI_INTERNAL_KEY: "${MELI_INTERNAL_KEY}"
+      MELI_SELLER_ID: "${MELI_SELLER_ID}"
+
+      TZ: "America/Sao_Paulo"
+      PYTHONPATH: "/app"
+
+    depends_on:
+      db_relatorios:
+        condition: service_healthy
+      meli_oauth:
+        condition: service_started
+
+    networks:
+      - backend
+      - internal_net
+
+    volumes:
+      - ./etl:/app/etl:rw
+      - ./etl/requirements.txt:/app/requirements.txt:ro
+
+    working_dir: /app
+
+    command: >
+      bash -lc "
+        pip install --no-cache-dir -r /app/requirements.txt &&
+        tail -f /dev/null
+      "
 
 
 networks:
   backend:
     name: project-backend
     driver: bridge
+
+  internal_net:
+    external: true
+    name: internal_net
 
 
 volumes:
